@@ -14,9 +14,10 @@ SPIClass mySPI(FSPI);
 #define RS485 Serial2  // RS485 on Serial2 (TX=17, RX=16)
 
 // Unique IDs for each node — set accordingly
-uint8_t thisID = 0x01;
-uint8_t peerID  = 0x02;
-
+uint8_t thisID = 0x02;
+uint8_t peerID  = 0x01;
+uint8_t packetSeq = 0;     // Sender: increments each packet
+uint8_t lastSeq   = 0xFF;  // Receiver: tracks last-seen sequence
 #define ACK 0x06
 #define NAK 0x15
 #define REQ_SEND 0xB1
@@ -55,9 +56,10 @@ bool sendDataPacket(uint8_t* payload, uint8_t length) {
   packet[i++] = 0xCD;
   packet[i++] = thisID;
   packet[i++] = peerID;
+  packet[i++] = packetSeq++; 
   packet[i++] = length;
   memcpy(&packet[i], payload, length); i += length;
-  uint16_t crc = crc16(&packet[2], 3 + length);
+  uint16_t crc = crc16(&packet[2], 4 + length);
   packet[i++] = crc >> 8;
   packet[i++] = crc & 0xFF;
   packet[i++] = 0xDC;
@@ -130,13 +132,20 @@ void sendFile(const char* filename) {
   uint8_t buffer[64];
   while (file.available()) {
     int len = file.read(buffer, sizeof(buffer));
-    sendDataPacket(buffer, len);
-    bool success = sendDataPacket(buffer, len);
-    if (!success) {
+    // sendDataPacket(buffer, len);
+    // bool success = sendDataPacket(buffer, len);
+    // if (!success) {
+    //   Serial.println("Packet send failed after retries. Aborting.");
+    //   file.close();
+    //   return;
+    // }
+    bool ok = sendDataPacket(buffer, len);
+    if (!ok) {
       Serial.println("Packet send failed after retries. Aborting.");
       file.close();
       return;
-    }
+    }   
+  
 
   }
 
@@ -164,6 +173,18 @@ void receiveFile(const char* destFile = "/recv.txt") {
       uint8_t sender = RS485.read();
       uint8_t target = RS485.read();
       if (target != thisID) continue; // Not for this node
+      uint8_t seq = RS485.read();        // ← **NEW** sequence byte
+
+      // Duplicate check
+      if (seq == lastSeq) {
+        // ACK again, but skip writing
+        delay(50);
+        RS485.write(ACK);
+        RS485.flush();
+        delay(10);
+        continue;
+      }
+      lastSeq = seq;
 
       uint8_t len = RS485.read();
       if (len > 64) { RS485.read(); RS485.read(); continue; }
@@ -192,12 +213,16 @@ void receiveFile(const char* destFile = "/recv.txt") {
       }
 
       // Recompute CRC
-      uint8_t check[3 + len];
+      // build buffer: sender, target, seq, length, payload
+      uint8_t check[4 + len];
       check[0] = sender;
       check[1] = target;
-      check[2] = len;
-      memcpy(&check[3], data, len);
-      uint16_t calcCRC = crc16(check, 3 + len);
+      check[2] = seq;    // ← include seq here
+      check[3] = len;
+      memcpy(&check[4], data, len);
+
+      // compute CRC over 4 header bytes + payload
+      uint16_t calcCRC = crc16(check, 4 + len);
       Serial.print("Received CRC: 0x"); Serial.println(receivedCRC, HEX);
       Serial.print("Computed CRC: 0x"); Serial.println(calcCRC, HEX);
 
